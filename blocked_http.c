@@ -24,7 +24,7 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 
-#include <string.h>
+#include <sys/systm.h>
 
 static pfil_hook_t http_hook = NULL;
 static long blocked_packets = 0;
