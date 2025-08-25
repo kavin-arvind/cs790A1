@@ -2,97 +2,139 @@
 #include <sys/module.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/ip_icmp.h>
-#include <net/pfil.h>
+#include <sys/systm.h>     /* printf, strstr */
+#include <sys/errno.h>
 #include <sys/mbuf.h>
 
-static unsigned int icmp_dropped = 0;
+#include <net/if.h>
+#include <net/pfil.h>
+
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+
+/* Counters */
+static unsigned int http_dropped = 0;
 static unsigned int total_dropped_size = 0;
 
-/* Hook Function */
-static pfil_return_t icmp_block_hook(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *arg, struct inpcb *inp) {
+/*
+ * Hook Function:
+ * Checks TCP packets for "blocked.com" in the HTTP Host header and drops them.
+ */
+static pfil_return_t
+http_block_hook(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *arg, struct inpcb *inp)
+{
     struct mbuf *m;
     struct ip *ip_hdr;
-    struct icmp *icmp_hdr;
-    
+    struct tcphdr *tcp_hdr;
+    int ip_hlen, tcp_hlen, payload_offset, payload_len, copy_len;
+    char buf[1025];
+
     m = *(pkt.m);
-    if (m == NULL) return PFIL_PASS;
+    if (m == NULL)
+        return PFIL_PASS;
 
-    if (dir != PFIL_IN) return PFIL_PASS;  // Only process incoming packets
+    /* Only check outgoing packets from client to server */
+    if (dir != PFIL_OUT)
+        return PFIL_PASS;
 
+    /* Get IP header */
     ip_hdr = mtod(m, struct ip *);
-    if (ip_hdr->ip_p == IPPROTO_ICMP) {
-        icmp_hdr = (struct icmp *)((char *)ip_hdr + (ip_hdr->ip_hl << 2));
-        if (icmp_hdr->icmp_type == ICMP_ECHO) {  // Echo Request
-            icmp_dropped++;
-            total_dropped_size += ntohs(ip_hdr->ip_len);
-            printf("ICMP Echo Request blocked. Total dropped: %u, Total size: %u bytes\n",
-                   icmp_dropped, total_dropped_size);
-            return PFIL_DROPPED;  // Drop the packet
-        }
+    if (ip_hdr->ip_p != IPPROTO_TCP)
+        return PFIL_PASS;
+
+    ip_hlen = ip_hdr->ip_hl << 2;
+    if (m->m_len < ip_hlen)
+        return PFIL_PASS;
+
+    /* TCP header is after IP header */
+    tcp_hdr = (struct tcphdr *)((char *)ip_hdr + ip_hlen);
+    tcp_hlen = tcp_hdr->th_off << 2;
+
+    /* Calculate HTTP payload position and length */
+    payload_offset = ip_hlen + tcp_hlen;
+    payload_len = ntohs(ip_hdr->ip_len) - payload_offset;
+    if (payload_len <= 0)
+        return PFIL_PASS;
+
+    copy_len = (payload_len > 1024) ? 1024 : payload_len;
+    m_copydata(m, payload_offset, copy_len, buf);
+    buf[copy_len] = '\0';
+
+    /* Look for Host header containing "blocked.com" */
+    if (strstr(buf, "blocked.com") != NULL) {
+        http_dropped++;
+        total_dropped_size += payload_len;
+        printf("blocked_http: Dropped HTTP request #%u (size=%d) containing 'blocked.com'\n",
+               http_dropped, payload_len);
+        return PFIL_DROPPED;  /* Tell kernel to drop packet */
     }
-    return PFIL_PASS;  // Allow other packets
+
+    return PFIL_PASS;
 }
 
-static struct pfil_hook *icmp_hook = NULL;
+/* Hook and link structures */
+static struct pfil_hook *http_hook = NULL;
 
-/* Module Load/Unload Handler */
-static int load_handler(module_t mod, int event_type, void *arg) {
+/* Module load/unload handler */
+static int
+load_handler(module_t mod, int event_type, void *arg)
+{
     struct pfil_hook_args pha;
     struct pfil_link_args pla;
 
     switch (event_type) {
-        case MOD_LOAD:
-            bzero(&pha, sizeof(pha));
-            pha.pa_version = PFIL_VERSION;
-            pha.pa_flags = PFIL_IN;
-            pha.pa_type = PFIL_TYPE_IP4;
-            pha.pa_func = icmp_block_hook;
-            pha.pa_ruleset = NULL;
-            pha.pa_modname = "icmp_block_mod";
-            pha.pa_rulname = "icmp_block_rule";
+    case MOD_LOAD:
+        bzero(&pha, sizeof(pha));
+        pha.pa_version = PFIL_VERSION;
+        pha.pa_flags = PFIL_OUT;           /* Outbound packets (client -> server) */
+        pha.pa_type = PFIL_TYPE_IP4;       /* IPv4 packets */
+        pha.pa_func = http_block_hook;
+        pha.pa_ruleset = NULL;
+        pha.pa_modname = "http_block_mod";
+        pha.pa_rulname = "http_block_rule";
 
-            icmp_hook = pfil_add_hook(&pha);
+        http_hook = pfil_add_hook(&pha);
+        if (http_hook == NULL) {
+            printf("Failed to register HTTP block hook.\n");
+            return EFAULT;
+        }
 
-            if (icmp_hook == NULL) {
-                printf("Failed to register ICMP block hook.\n");
-                return EFAULT;
-            }
+        /* Link the hook to IPv4 ("inet") */
+        bzero(&pla, sizeof(pla));
+        pla.pa_version = PFIL_VERSION;
+        pla.pa_flags = PFIL_OUT | PFIL_HOOKPTR;
+        pla.pa_headname = "inet";
+        pla.pa_hook = http_hook;
 
-            pla.pa_version = PFIL_VERSION;
-            pla.pa_flags = PFIL_IN | PFIL_HOOKPTR;
-            pla.pa_headname = "inet";
-            pla.pa_hook = icmp_hook;
+        if (pfil_link(&pla) != 0) {
+            printf("Failed to link HTTP block hook.\n");
+            pfil_remove_hook(http_hook);
+            return EFAULT;
+        }
 
-            if (pfil_link(&pla) != 0) {
-                printf("Failed to link ICMP block hook.\n");
-                pfil_remove_hook(icmp_hook);
-                return EFAULT;
-            }
+        printf("HTTP Block Module loaded successfully.\n");
+        break;
 
-            printf("ICMP Block Module loaded successfully.\n");
-            break;
+    case MOD_UNLOAD:
+        if (http_hook != NULL) {
+            pfil_remove_hook(http_hook);
+            http_hook = NULL;
+        }
+        printf("HTTP Block Module unloaded. Total dropped: %u packets, %u bytes\n",
+               http_dropped, total_dropped_size);
+        break;
 
-        case MOD_UNLOAD:
-            if (icmp_hook != NULL) {
-                pfil_remove_hook(icmp_hook);
-                printf("ICMP Block Module unloaded.\n");
-            }
-            break;
-
-        default:
-            return EOPNOTSUPP;
+    default:
+        return EOPNOTSUPP;
     }
     return 0;
 }
 
-static moduledata_t icmp_block_mod = {
-    "icmp_block",      // Module name
-    load_handler,      // Event handler
-    NULL               // Extra data
+static moduledata_t http_block_mod = {
+    "blocked_http",
+    load_handler,
+    NULL
 };
 
-DECLARE_MODULE(icmp_block, icmp_block_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
+DECLARE_MODULE(blocked_http, http_block_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
