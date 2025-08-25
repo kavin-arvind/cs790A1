@@ -2,7 +2,7 @@
 #include <sys/module.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
-#include <sys/systm.h>     /* printf, strstr */
+#include <sys/systm.h>     /* printf, bzero, strstr, etc. */
 #include <sys/errno.h>
 #include <sys/mbuf.h>
 
@@ -13,126 +13,151 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 
-/* Counters */
+/* Simple counters for your report */
 static unsigned int http_dropped = 0;
 static unsigned int total_dropped_size = 0;
 
 /*
- * Hook Function:
- * Checks TCP packets for "blocked.com" in the HTTP Host header and drops them.
+ * pfil mbuf check hook (FreeBSD 14.x API):
+ * Prototype: pfil_return_t (*pfil_mbuf_chk_t)(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp);
  */
 static pfil_return_t
-http_block_hook(pfil_packet_t pkt, struct ifnet *ifp, int dir, void *arg, struct inpcb *inp)
+http_block_mbuf(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp)
 {
     struct mbuf *m;
-    struct ip *ip_hdr;
-    struct tcphdr *tcp_hdr;
-    int ip_hlen, tcp_hlen, payload_offset, payload_len, copy_len;
-    char buf[1025];
+    struct ip *ip;
+    struct tcphdr *th;
+    int ip_hlen, tcp_hlen, payload_off, payload_len, copy_len;
+    char buf[1025]; /* copy up to 1024 bytes from HTTP payload */
 
-    m = *(pkt.m);
-    if (m == NULL)
-        return PFIL_PASS;
-
-    /* Only check outgoing packets from client to server */
+    /* Only filter outbound (client -> server) IPv4 traffic */
     if (dir != PFIL_OUT)
         return PFIL_PASS;
 
-    /* Get IP header */
-    ip_hdr = mtod(m, struct ip *);
-    if (ip_hdr->ip_p != IPPROTO_TCP)
+    m = *mp;
+    if (m == NULL)
         return PFIL_PASS;
 
-    ip_hlen = ip_hdr->ip_hl << 2;
-    if (m->m_len < ip_hlen)
+    /* Ensure the first mbuf has at least the IPv4 header */
+    if (m->m_len < (int)sizeof(struct ip)) {
+        /* We can still copy from the chain using m_copydata() */
+    }
+
+    /* IP header is at the start of packet data */
+    ip = mtod(m, struct ip *);
+    if (ip->ip_v != 4)
         return PFIL_PASS;
 
-    /* TCP header is after IP header */
-    tcp_hdr = (struct tcphdr *)((char *)ip_hdr + ip_hlen);
-    tcp_hlen = tcp_hdr->th_off << 2;
-
-    /* Calculate HTTP payload position and length */
-    payload_offset = ip_hlen + tcp_hlen;
-    payload_len = ntohs(ip_hdr->ip_len) - payload_offset;
-    if (payload_len <= 0)
+    if (ip->ip_p != IPPROTO_TCP)
         return PFIL_PASS;
 
+    ip_hlen = ip->ip_hl << 2;
+    if (ip_hlen < (int)sizeof(struct ip))
+        return PFIL_PASS;
+
+    /* TCP header starts right after IP header */
+    if (m->m_pkthdr.len < ip_hlen + (int)sizeof(struct tcphdr))
+        return PFIL_PASS;
+
+    /* Safely read the fixed TCP header fields */
+    {
+        struct tcphdr th_stack;
+        m_copydata(m, ip_hlen, sizeof(th_stack), (caddr_t)&th_stack);
+        th = &th_stack;
+    }
+
+    tcp_hlen = th->th_off << 2;
+    if (tcp_hlen < (int)sizeof(struct tcphdr))
+        return PFIL_PASS;
+
+    payload_off = ip_hlen + tcp_hlen;
+
+    /* Total IP length (header + TCP + payload) comes from ip->ip_len */
+    {
+        int ip_total = ntohs(ip->ip_len);
+        if (ip_total <= payload_off)
+            return PFIL_PASS;
+        payload_len = ip_total - payload_off;
+    }
+
+    /* Copy up to 1024 bytes of payload into buf and NUL-terminate */
     copy_len = (payload_len > 1024) ? 1024 : payload_len;
-    m_copydata(m, payload_offset, copy_len, buf);
+    m_copydata(m, payload_off, copy_len, (caddr_t)buf);
     buf[copy_len] = '\0';
 
-    /* Look for Host header containing "blocked.com" */
+    /* Look for blocked host token anywhere in the HTTP payload */
     if (strstr(buf, "blocked.com") != NULL) {
         http_dropped++;
         total_dropped_size += payload_len;
-        printf("blocked_http: Dropped HTTP request #%u (size=%d) containing 'blocked.com'\n",
+        printf("blocked_http(14.x): drop #%u, payload=%d bytes, matched 'blocked.com'\n",
                http_dropped, payload_len);
-        return PFIL_DROPPED;  /* Tell kernel to drop packet */
+        return PFIL_DROPPED; /* tell pfil to drop this packet */
     }
 
     return PFIL_PASS;
 }
 
-/* Hook and link structures */
+/* Keep the hook handle so we can unregister on unload */
 static struct pfil_hook *http_hook = NULL;
 
-/* Module load/unload handler */
 static int
-load_handler(module_t mod, int event_type, void *arg)
+load_handler(module_t mod, int evt, void *arg)
 {
-    struct pfil_hook_args pha;
-    struct pfil_link_args pla;
+    switch (evt) {
+    case MOD_LOAD: {
+        struct pfil_hook_args pha;
+        struct pfil_link_args pla;
 
-    switch (event_type) {
-    case MOD_LOAD:
         bzero(&pha, sizeof(pha));
-        pha.pa_version = PFIL_VERSION;
-        pha.pa_flags = PFIL_OUT;           /* Outbound packets (client -> server) */
-        pha.pa_type = PFIL_TYPE_IP4;       /* IPv4 packets */
-        pha.pa_func = http_block_hook;
-        pha.pa_ruleset = NULL;
-        pha.pa_modname = "http_block_mod";
-        pha.pa_rulname = "http_block_rule";
+        pha.pa_version   = PFIL_VERSION;
+        pha.pa_flags     = PFIL_OUT;           /* outbound only */
+        pha.pa_type      = PFIL_TYPE_IP4;      /* IPv4 */
+        pha.pa_mbuf_chk  = http_block_mbuf;    /* <-- FreeBSD 14.x field */
+        pha.pa_modname   = "http_block_mod";
+        pha.pa_rulname   = "http_block_rule";
+        pha.pa_ruleset   = NULL;
 
         http_hook = pfil_add_hook(&pha);
         if (http_hook == NULL) {
-            printf("Failed to register HTTP block hook.\n");
+            printf("blocked_http: pfil_add_hook failed\n");
             return EFAULT;
         }
 
-        /* Link the hook to IPv4 ("inet") */
         bzero(&pla, sizeof(pla));
-        pla.pa_version = PFIL_VERSION;
-        pla.pa_flags = PFIL_OUT | PFIL_HOOKPTR;
-        pla.pa_headname = "inet";
-        pla.pa_hook = http_hook;
+        pla.pa_version   = PFIL_VERSION;
+        pla.pa_flags     = PFIL_OUT | PFIL_HOOKPTR;
+        pla.pa_headname  = "inet";             /* IPv4 head */
+        pla.pa_hook      = http_hook;
 
         if (pfil_link(&pla) != 0) {
-            printf("Failed to link HTTP block hook.\n");
+            printf("blocked_http: pfil_link failed\n");
             pfil_remove_hook(http_hook);
+            http_hook = NULL;
             return EFAULT;
         }
 
-        printf("HTTP Block Module loaded successfully.\n");
+        printf("blocked_http: loaded (FreeBSD 14.x pfil API)\n");
         break;
+    }
 
     case MOD_UNLOAD:
         if (http_hook != NULL) {
             pfil_remove_hook(http_hook);
             http_hook = NULL;
         }
-        printf("HTTP Block Module unloaded. Total dropped: %u packets, %u bytes\n",
+        printf("blocked_http: unloaded. dropped=%u, total_bytes=%u\n",
                http_dropped, total_dropped_size);
         break;
 
     default:
         return EOPNOTSUPP;
     }
+
     return 0;
 }
 
 static moduledata_t http_block_mod = {
-    "blocked_http",
+    "blocked_http",   /* module name */
     load_handler,
     NULL
 };
