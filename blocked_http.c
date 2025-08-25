@@ -21,8 +21,8 @@ static unsigned int total_dropped_size = 0;
  * pfil mbuf check hook (FreeBSD 14.x API):
  * Prototype: pfil_return_t (*pfil_mbuf_chk_t)(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp);
  */
-static int
-http_block_mbuf(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp)
+static pfil_return_t
+http_block_mbuf(struct mbuf **mp, struct ifnet *ifp, int dir, void *arg, struct inpcb *inp)
 {
     struct mbuf *m;
     struct ip *ip;
