@@ -2,7 +2,7 @@
 #include <sys/module.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
-#include <sys/systm.h>     /* printf, bzero, strstr, etc. */
+#include <sys/systm.h>
 #include <sys/errno.h>
 #include <sys/mbuf.h>
 
@@ -13,14 +13,9 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 
-/* Simple counters for your report */
 static unsigned int http_dropped = 0;
 static unsigned int total_dropped_size = 0;
 
-/*
- * pfil mbuf check hook (FreeBSD 14.x API):
- * Prototype: pfil_return_t (*pfil_mbuf_chk_t)(void *arg, struct mbuf **mp, struct ifnet *ifp, int dir, struct inpcb *inp);
- */
 static pfil_return_t
 http_block_mbuf(struct mbuf **mp, struct ifnet *ifp, int dir, void *arg, struct inpcb *inp)
 {
@@ -28,9 +23,9 @@ http_block_mbuf(struct mbuf **mp, struct ifnet *ifp, int dir, void *arg, struct 
     struct ip *ip;
     struct tcphdr *th;
     int ip_hlen, tcp_hlen, payload_off, payload_len, copy_len;
-    char buf[1025]; /* copy up to 1024 bytes from HTTP payload */
+    char buf[1025];
 
-    /* Only filter outbound (client -> server) IPv4 traffic */
+    // we filter only packets from client to VM B (middle man).
     if (dir != PFIL_OUT)
         return PFIL_PASS;
 
@@ -38,12 +33,7 @@ http_block_mbuf(struct mbuf **mp, struct ifnet *ifp, int dir, void *arg, struct 
     if (m == NULL)
         return PFIL_PASS;
 
-    /* Ensure the first mbuf has at least the IPv4 header */
-    if (m->m_len < (int)sizeof(struct ip)) {
-        /* We can still copy from the chain using m_copydata() */
-    }
-
-    /* IP header is at the start of packet data */
+    // IP header at the start
     ip = mtod(m, struct ip *);
     if (ip->ip_v != 4)
         return PFIL_PASS;
@@ -55,7 +45,7 @@ http_block_mbuf(struct mbuf **mp, struct ifnet *ifp, int dir, void *arg, struct 
     if (ip_hlen < (int)sizeof(struct ip))
         return PFIL_PASS;
 
-    /* TCP header starts right after IP header */
+    // TCP is after the IP header
     if (m->m_pkthdr.len < ip_hlen + (int)sizeof(struct tcphdr))
         return PFIL_PASS;
 
@@ -110,9 +100,9 @@ load_handler(module_t mod, int evt, void *arg)
 
         bzero(&pha, sizeof(pha));
         pha.pa_version   = PFIL_VERSION;
-        pha.pa_flags     = PFIL_OUT;           /* outbound only */
-        pha.pa_type      = PFIL_TYPE_IP4;      /* IPv4 */
-        pha.pa_mbuf_chk  = http_block_mbuf;    /* <-- FreeBSD 14.x field */
+        pha.pa_flags     = PFIL_OUT;
+        pha.pa_type      = PFIL_TYPE_IP4;
+        pha.pa_mbuf_chk  = http_block_mbuf;
         pha.pa_modname   = "http_block_mod";
         pha.pa_rulname   = "http_block_rule";
         pha.pa_ruleset   = NULL;
@@ -157,7 +147,7 @@ load_handler(module_t mod, int evt, void *arg)
 }
 
 static moduledata_t http_block_mod = {
-    "blocked_http",   /* module name */
+    "blocked_http",
     load_handler,
     NULL
 };
